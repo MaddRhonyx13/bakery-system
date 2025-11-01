@@ -1,94 +1,72 @@
 const express = require("express");
 const cors = require("cors");
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const path = require('path');
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
-// SQLite database (file-based, no server needed)
 const dbPath = process.env.NODE_ENV === 'production' 
   ? '/tmp/bakery.db' 
   : path.join(__dirname, 'bakery.db');
 
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('Error opening database:', err);
-  } else {
-    console.log('✅ Connected to SQLite database');
-    initializeDatabase();
+const db = new Database(dbPath);
+console.log('✅ Connected to SQLite database');
+
+function initializeDatabase() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT UNIQUE NOT NULL,
+      customer_name TEXT NOT NULL,
+      contact_number TEXT,
+      item TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      order_date TEXT NOT NULL,
+      status TEXT DEFAULT 'Pending',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  
+  console.log('✅ Orders table ready');
+  
+  const rowCount = db.prepare('SELECT COUNT(*) as count FROM orders').get();
+  if (rowCount.count === 0) {
+    const insert = db.prepare(`
+      INSERT INTO orders (order_id, customer_name, contact_number, item, quantity, order_date, status) 
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    const sampleData = [
+      ['ORD001', 'John Smith', '123-456-7890', 'Cake', 2, '2024-01-15', 'Completed'],
+      ['ORD002', 'Emma Johnson', '123-456-7891', 'Bread', 5, '2024-01-16', 'Pending'],
+      ['ORD003', 'Michael Brown', '123-456-7892', 'Muffin', 12, '2024-01-16', 'Pending']
+    ];
+    
+    sampleData.forEach(data => {
+      insert.run(data);
+    });
+    
+    console.log('✅ Sample data inserted');
+  }
+}
+
+initializeDatabase();
+
+app.get("/api/orders", (req, res) => {
+  try {
+    const stmt = db.prepare("SELECT * FROM orders ORDER BY order_date DESC, created_at DESC");
+    const orders = stmt.all();
+    res.json(orders);
+  } catch (err) {
+    console.error("Database error:", err);
+    res.status(500).json({ error: "Database error" });
   }
 });
 
-// Initialize database tables
-function initializeDatabase() {
-  db.run(`CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id TEXT UNIQUE NOT NULL,
-    customer_name TEXT NOT NULL,
-    contact_number TEXT,
-    item TEXT NOT NULL,
-    quantity INTEGER NOT NULL,
-    order_date TEXT NOT NULL,
-    status TEXT DEFAULT 'Pending',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`, (err) => {
-    if (err) {
-      console.error('Error creating table:', err);
-    } else {
-      console.log('✅ Orders table ready');
-      // Insert sample data if empty
-      insertSampleData();
-    }
-  });
-}
-
-function insertSampleData() {
-  const checkSql = "SELECT COUNT(*) as count FROM orders";
-  db.get(checkSql, [], (err, row) => {
-    if (err) {
-      console.error('Error checking data:', err);
-      return;
-    }
-    
-    if (row.count === 0) {
-      const sampleData = [
-        ['ORD001', 'John Smith', '123-456-7890', 'Cake', 2, '2024-01-15', 'Completed'],
-        ['ORD002', 'Emma Johnson', '123-456-7891', 'Bread', 5, '2024-01-16', 'Pending'],
-        ['ORD003', 'Michael Brown', '123-456-7892', 'Muffin', 12, '2024-01-16', 'Pending']
-      ];
-      
-      const insertSql = `INSERT INTO orders (order_id, customer_name, contact_number, item, quantity, order_date, status) 
-                         VALUES (?, ?, ?, ?, ?, ?, ?)`;
-      
-      sampleData.forEach(data => {
-        db.run(insertSql, data, (err) => {
-          if (err) {
-            console.error('Error inserting sample data:', err);
-          }
-        });
-      });
-      console.log('✅ Sample data inserted');
-    }
-  });
-}
-
-// GET all orders
-app.get("/api/orders", (req, res) => {
-  const query = "SELECT * FROM orders ORDER BY order_date DESC, created_at DESC";
-  db.all(query, [], (err, rows) => {
-    if (err) {
-      console.error("Database error:", err);
-      res.status(500).json({ error: "Database error" });
-    } else {
-      res.json(rows);
-    }
-  });
-});
-
-// POST new order
 app.post("/api/orders", (req, res) => {
   const { order_id, customer_name, contact_number, item, quantity, order_date, status } = req.body;
   
@@ -96,32 +74,43 @@ app.post("/api/orders", (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  const query = `INSERT INTO orders (order_id, customer_name, contact_number, item, quantity, order_date, status) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?)`;
-  
-  const values = [order_id, customer_name, contact_number || '', item, quantity, order_date || new Date().toISOString().split('T')[0], status || 'Pending'];
-
-  db.run(query, values, function(err) {
-    if (err) {
-      if (err.message.includes('UNIQUE constraint failed')) {
-        return res.status(409).json({ error: "Order ID already exists" });
-      }
-      console.error("Insert error:", err);
-      res.status(500).json({ error: "Failed to create order" });
-    } else {
-      // Return the created order
-      db.get("SELECT * FROM orders WHERE id = ?", [this.lastID], (err, row) => {
-        if (err) {
-          res.json({ message: "Order created successfully", orderId: this.lastID });
-        } else {
-          res.json({ message: "Order created successfully", order: row });
-        }
-      });
+  try {
+    const checkStmt = db.prepare("SELECT id FROM orders WHERE order_id = ?");
+    const existing = checkStmt.get(order_id);
+    
+    if (existing) {
+      return res.status(409).json({ error: "Order ID already exists" });
     }
-  });
+
+    const insertStmt = db.prepare(`
+      INSERT INTO orders (order_id, customer_name, contact_number, item, quantity, order_date, status) 
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    const result = insertStmt.run(
+      order_id,
+      customer_name,
+      contact_number || '',
+      item,
+      quantity,
+      order_date || new Date().toISOString().split('T')[0],
+      status || 'Pending'
+    );
+
+    const getStmt = db.prepare("SELECT * FROM orders WHERE id = ?");
+    const newOrder = getStmt.get(result.lastInsertRowid);
+    
+    res.json({ 
+      message: "Order created successfully", 
+      order: newOrder
+    });
+    
+  } catch (err) {
+    console.error("Insert error:", err);
+    res.status(500).json({ error: "Failed to create order" });
+  }
 });
 
-// UPDATE order status
 app.put("/api/orders/:id", (req, res) => {
   const orderId = req.params.id;
   const { status } = req.body;
@@ -130,51 +119,47 @@ app.put("/api/orders/:id", (req, res) => {
     return res.status(400).json({ error: "Invalid status" });
   }
 
-  const query = "UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?";
-  
-  db.run(query, [status, orderId], function(err) {
-    if (err) {
-      console.error("Update error:", err);
-      res.status(500).json({ error: "Failed to update order" });
-    } else if (this.changes === 0) {
+  try {
+    const stmt = db.prepare("UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+    const result = stmt.run(status, orderId);
+    
+    if (result.changes === 0) {
       res.status(404).json({ error: "Order not found" });
     } else {
       res.json({ message: "Order status updated successfully" });
     }
-  });
+  } catch (err) {
+    console.error("Update error:", err);
+    res.status(500).json({ error: "Failed to update order" });
+  }
 });
 
-// DELETE order
 app.delete("/api/orders/:id", (req, res) => {
   const orderId = req.params.id;
   
-  // First get the order
-  db.get("SELECT * FROM orders WHERE id = ?", [orderId], (err, row) => {
-    if (err) {
-      console.error("Select error:", err);
-      return res.status(500).json({ error: "Database error" });
-    }
+  try {
+    const getStmt = db.prepare("SELECT * FROM orders WHERE id = ?");
+    const order = getStmt.get(orderId);
     
-    if (!row) {
+    if (!order) {
       return res.status(404).json({ error: "Order not found" });
     }
     
-    // Then delete it
-    db.run("DELETE FROM orders WHERE id = ?", [orderId], function(err) {
-      if (err) {
-        console.error("Delete error:", err);
-        res.status(500).json({ error: "Failed to delete order" });
-      } else {
-        res.json({ 
-          message: "Order deleted successfully",
-          deletedOrder: row
-        });
-      }
+    const deleteStmt = db.prepare("DELETE FROM orders WHERE id = ?");
+    deleteStmt.run(orderId);
+    
+    res.json({ 
+      message: "Order deleted successfully",
+      deletedOrder: order
     });
-  });
+    
+  } catch (err) {
+    console.error("Delete error:", err);
+    res.status(500).json({ error: "Failed to delete order" });
+  }
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
